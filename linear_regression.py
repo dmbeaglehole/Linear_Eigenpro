@@ -22,29 +22,22 @@ def get_devices_list():
         devices = ['cpu']
     return devices
 
-def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epochs=5, reg=5e-5, jacobian_reg=None, mb_reiterates=1):
+def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5, jacobian_reg=None, mb_reiterates=1):
 
     devices = get_devices_list()
     num_devices = len(devices)
     print(f'Total devices: {num_devices}')
     num_classes = train_y.shape[1]
 
-    num_params = get_param_count(model, ntk_layer=0)
-    num_ntk_params = get_param_count(model, ntk_layer)
-    print(f'Total params: {num_params}')
-    print(f'Total ntk params: {num_ntk_params}')
-
     s = min(len(train_X),s)
     q = min(len(train_X)-1,q)
     m = int(128*num_devices)
     
     s_idx = np.random.choice(len(train_X), size=s, replace=False)
-    models = scatter_copies(model, devices)
 
     print("Computing K_s")
     start = time.time()
-    Ks = parallel_feature_multiply(models, devices, train_X[s_idx], train_X[s_idx], 
-                                    m//num_devices).to(devices[0]).double() # s_i x s
+    Ks = batch_multiply(train_X[s_idx], train_X[s_idx], m//num_devices).to(devices[0]).double()
     end = time.time()
     print("Ks comp. time:",end-start)
 
@@ -72,7 +65,7 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
         U_batches = torch.split(Us[i], ub_size)
         for b in range(len(U_batches)):
             U_ub = U_batches[b]
-            Phi_ub = get_feature_map(models[i], Xs_ubs[b], ntk_layer)
+            Phi_ub = Phi(Xs_ubs[b])
             new_U[i] += Phi_ub.T@U_ub / (Ls[i][:q]**0.5) # L:(q,) , Phi_X_s.T@U : (p,q) -> U: (p,q)
 
     U = torch.cuda.comm.reduce_add(new_U)
@@ -103,7 +96,7 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
         t3 = gradient - U @ t2 # (n_params, 1)
         return t3
 
-    def train_step(models, w, X_mb, y_mb, eta, devices):
+    def train_step(w, X_mb, y_mb, eta, devices):
         bs = len(X_mb)
 
        
@@ -111,10 +104,10 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
         X_ubs = torch.cuda.comm.scatter(X_mb, devices)
         Phi_ubs = [None]*num_devices
         for i, device in enumerate(devices):
-            Phi_ubs[i] = get_feature_map(models[i], X_ubs[i], ntk_layer)
+            Phi_ubs[i] = Phi(X_ubs[i])
 
         # gradient update
-        def microbatch_grad(model, X_ub, Phi_ub, y_ub, w, device_id):
+        def microbatch_grad(X_ub, Phi_ub, y_ub, w, device_id):
 
             minibatch_gradient = Phi_ub.T @ (Phi_ub @ w - y_ub) # train_y[b]) 
 
@@ -122,7 +115,7 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
             if jacobian_reg is not None:
                 start = time.time()
                 def single_JtJw(w_):
-                    return my_JtJw(model, X_ub, w_)
+                    return my_JtJw(Phi, X_ub, w_)
                 jac_grad = jacobian_reg * vmap(single_JtJw)(w.T).T
             return preconditioned(minibatch_gradient + reg*w + jac_grad, device_id)
         
@@ -131,7 +124,7 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
             y_ubs = torch.cuda.comm.scatter(y_mb, devices)
             grads = [None]*num_devices
             for i, device in enumerate(devices):
-                grads[i] = microbatch_grad(models[i], X_ubs[i], Phi_ubs[i], y_ubs[i], ws[i], i)/len(devices)
+                grads[i] = microbatch_grad(X_ubs[i], Phi_ubs[i], y_ubs[i], ws[i], i)/len(devices)
 
             grad = torch.cuda.comm.reduce_add(grads)
             w = w - eta/bs*grad
@@ -147,11 +140,11 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
 
         return w, train_error_mb, train_acc_mb
 
-    def test_step(models, w, X_mb, y_mb, devices):
+    def test_step(w, X_mb, y_mb, devices):
         X_ubs = torch.cuda.comm.scatter(X_mb, devices)
         Phi_ubs = [None]*num_devices
         for i, device in enumerate(devices):
-            Phi_ubs[i] = get_feature_map(models[i], X_ubs[i], ntk_layer)
+            Phi_ubs[i] = Phi(X_ubs[i])
 
         Xws = [None]*num_devices
         for i in range(num_devices):
@@ -163,13 +156,12 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
         return loss, acc
         
     
-    def tune_eta(train_X, train_y, beta, m, model, num_ntk_params):
+    def tune_eta(train_X, train_y, beta, m):
         if m < beta / lam_qp1 + 1:
             eta = m / beta
         else:
             eta = 0.99 * 2 * m / (beta + (m - 1) * lam_qp1)
         
-        #eta = eta*(1.5**22)
         factor = 1.5
         num_classes = train_y.shape[1]
         
@@ -194,7 +186,7 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
                     
                     X_mb = train_X[b]
                     y_mb = train_y[b]
-                    w, train_error_mb, train_acc_mb = train_step(models, w, X_mb, y_mb, eta, devices)
+                    w, train_error_mb, train_acc_mb = train_step(w, X_mb, y_mb, eta, devices)
 
                     if t==1:
                         comp_error = train_error_mb
@@ -210,7 +202,7 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
 
     print("Tuning LR")
     start = time.time()
-    eta = tune_eta(train_X, train_y, beta, m, model, num_ntk_params)
+    eta = tune_eta(train_X, train_y, beta, m)
     end = time.time()
     print("Tuning time:",end-start)
 
@@ -233,7 +225,7 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
             y_mb = train_y[b]
             bs = len(X_mb)
              
-            w, train_error_mb, train_acc_mb = train_step(models, w, X_mb, y_mb, eta, devices)
+            w, train_error_mb, train_acc_mb = train_step(w, X_mb, y_mb, eta, devices)
 
             tot_loss += train_error_mb*bs
             tot_acc += train_acc_mb*bs
@@ -258,7 +250,7 @@ def train(model, train_X, train_y, test_X, test_y, s=5120, q=8, ntk_layer=0, epo
                 y_mb = test_y[b]
                 bs = len(X_mb)
                
-                loss_mb, acc_mb = test_step(models, w, X_mb, y_mb, devices)
+                loss_mb, acc_mb = test_step(w, X_mb, y_mb, devices)
                 loss += loss_mb*bs
                 tot += acc_mb*bs
                 n_test += len(b)
