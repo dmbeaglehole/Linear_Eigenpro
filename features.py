@@ -67,7 +67,7 @@ def batch_norm(x1, device):
 
     return torch.concat(prod,dim=0)
 
-def batch_multiply(x1, x2, device):
+def batch_multiply(x1, x2):
     mb_size = 64
     n1_batches = len(x1)//mb_size  + 1
     n2_batches = len(x2)//mb_size  + 1
@@ -76,7 +76,7 @@ def batch_multiply(x1, x2, device):
     for i in range(n1_batches):
         s1 = i*mb_size
         e1 = (i+1)*mb_size if i<n1_batches-1 else len(x1)
-        x1_mb = x1[s1:e1].to(device).double()
+        x1_mb = x1[s1:e1].double()
         if len(x1_mb)==0:
             continue
 
@@ -84,11 +84,11 @@ def batch_multiply(x1, x2, device):
         for j in range(n2_batches):
             s2 = j*mb_size
             e2 = (j+1)*mb_size if i<n2_batches-1 else len(x2)
-            x2_mb = x2[s2:e2].to(device).double()
+            x2_mb = x2[s2:e2].double()
             if len(x1_mb)==0:
                 continue
 
-            prod_1.append((x1_mb@x2_mb.T).cpu())
+            prod_1.append(x1_mb@x2_mb.T)
 
             del x2_mb
         del x1_mb
@@ -158,17 +158,17 @@ def parallel_feature_multiply(models, devices, x1, x2, mb_size=32):
     
     return torch.cuda.comm.gather(K_rows, destination="cpu")
 
-def my_JtJw(model, X_ub, w):
+def my_JtJw(Phi, X_ub, w):
     n, d = X_ub.shape 
-    def Phi(X):
+    def Phi_(X):
         """
         X : (n*d, )
         out : (p, )
         """
-        return get_feature_map(model, X.reshape(n, d)).sum(dim=0)
+        return Phi(X.reshape(n, d)).sum(dim=0)
     
-    Jw_f = vjp(Phi, X_ub.reshape(-1))[1]
+    Jw_f = vjp(Phi_, X_ub.reshape(-1))[1]
     Jw = Jw_f(w)[0]
-    JtJw = jvp(Phi, (X_ub.reshape(-1),), (Jw,))[1]
+    JtJw = jvp(Phi_, (X_ub.reshape(-1),), (Jw,))[1]
     return JtJw
 

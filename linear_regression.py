@@ -22,11 +22,13 @@ def get_devices_list():
         devices = ['cpu']
     return devices
 
-def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5, jacobian_reg=None, mb_reiterates=1):
+def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5, jacobian_reg=None, mb_reiterates=1, verbose=True):
 
-    devices = get_devices_list()
+    devices = [torch.device(x) for x in get_devices_list()]
     num_devices = len(devices)
-    print(f'Total devices: {num_devices}')
+    if verbose:
+        print(f'Total devices: {num_devices}')
+        print("Devices", devices)
     num_classes = train_y.shape[1]
 
     s = min(len(train_X),s)
@@ -34,19 +36,22 @@ def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5
     m = int(128*num_devices)
     
     s_idx = np.random.choice(len(train_X), size=s, replace=False)
-
-    print("Computing K_s")
+    
+    if verbose:
+        print("Computing K_s")
     start = time.time()
-    Ks = batch_multiply(train_X[s_idx], train_X[s_idx], m//num_devices).to(devices[0]).double()
+    Phi_Xs = Phi(train_X[s_idx].to(devices[0])).double()
+    sketch_dim = Phi_Xs.shape[1]
+    Ks = Phi_Xs@Phi_Xs.T
     end = time.time()
-    print("Ks comp. time:",end-start)
+    if verbose:
+        print("Ks comp. time:",end-start)
+        print("Running LOBPCG")
 
-    print("Running LOBPCG")
     L, U = torch.lobpcg(Ks, q+1) # top q+1 eigenvalues/vectors of Ks
     beta = Ks.max()
     del Ks
     
-    print("transforming eigenvectors")
     U = U.to(train_X.dtype)
     L = L.to(train_X.dtype)
     U = U[:,:q]
@@ -56,7 +61,6 @@ def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5
     Us = torch.cuda.comm.scatter(U, devices)
     Ls = scatter_copies(L, devices)
 
-    print("scattered copies")
 
     # Not parallel because Phi_X_s is on CPU
     for i, device in enumerate(devices):
@@ -74,13 +78,12 @@ def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5
     lam_qp1 = L[q].cpu()+0
     L = L[:q]
 
-    print("eigenvalues:",L)
-    print("Pre-conditioner svd done")
+    if verbose:
+        print("eigenvalues:",L)
+        print("Pre-conditioner svd done")
     U = U.to(train_X.dtype)
     L = L.to(train_X.dtype)
 
-    print("U",U.shape)
-    print("L",L.shape)
     
     del Xs_mbs, new_U, 
 
@@ -132,7 +135,7 @@ def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5
         Xws = [None]*num_devices
         for i in range(num_devices):
             Xws[i] = Phi_ubs[i]@ws[i]
-        Xw = torch.cuda.comm.gather(Xws, destination="cpu")
+        Xw = torch.cuda.comm.gather(Xws)
 
         train_error_mb = mse(Xw, y_mb)
         train_acc_mb = accuracy(Xw, torch.argmax(y_mb,dim=1), 
@@ -149,7 +152,7 @@ def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5
         Xws = [None]*num_devices
         for i in range(num_devices):
             Xws[i] = Phi_ubs[i]@ws[i]
-        Xw = torch.cuda.comm.gather(Xws, destination="cpu")
+        Xw = torch.cuda.comm.gather(Xws)
         loss = mse(Xw,y_mb)
         acc = accuracy(Xw, torch.argmax(y_mb,dim=1), 
                         task='multiclass', num_classes=num_classes)
@@ -166,9 +169,10 @@ def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5
         num_classes = train_y.shape[1]
         
         while True:
-
-            print(f'Current eta: {eta}')
-            w = torch.zeros((num_ntk_params, num_classes)).to(train_X.dtype).to(devices[0])
+            
+            if verbose:
+                print(f'Current eta: {eta}')
+            w = torch.zeros((sketch_dim, num_classes)).to(train_X.dtype).to(devices[0])
             batch_ids = torch.split(torch.randperm(len(train_X)), m)
                 
             comp_error = None
@@ -190,30 +194,35 @@ def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5
 
                     if t==1:
                         comp_error = train_error_mb
-                        print("Comp error",comp_error)
+                        if verbose:
+                            print("Comp error",comp_error)
 
                     if train_error_mb > thresh*comp_error:
-                        return eta/(factor**3)
+                        return eta/(factor**4)
 
-            print("Train error at last batch",train_error_mb.item())
-            print("Doubling eta")
-            print()
+            if verbose:
+                print("Train error at last batch",train_error_mb.item())
+                print("Doubling eta")
+                print()
             eta = eta*factor
-
-    print("Tuning LR")
+    
+    print()
+    print("Tuning LR...")
     start = time.time()
     eta = tune_eta(train_X, train_y, beta, m)
     end = time.time()
     print("Tuning time:",end-start)
 
-    w = torch.zeros((num_ntk_params,num_classes)).to(train_X.dtype).to(devices[0])
+    w = torch.zeros((sketch_dim,num_classes)).to(train_X.dtype).to(devices[0])
     
     best_w = None
     best_loss = None
     best_acc = -1*float("inf")
-
-    for t in range(epochs): # epoch
-        print(f'Epoch {t+1} out of {epochs}')
+    
+    print("Training...")
+    for t in tqdm(range(epochs)): # epoch
+        if verbose:
+            print(f'Epoch {t+1} out of {epochs}')
         start = time.time()
         batch_ids = torch.split(torch.randperm(len(train_X)), m)
             
@@ -231,10 +240,11 @@ def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5
             tot_acc += train_acc_mb*bs
 
         end = time.time()
-        print(f'epoch time: {end-start}')
-        print(f'train acc: {100*tot_acc/len(train_X)}')
-        print(f'train error: {tot_loss/len(train_X)}')
-        print()
+        if verbose:
+            print(f'epoch time: {end-start}')
+            print(f'train acc: {100*tot_acc/len(train_X)}')
+            print(f'train error: {tot_loss/len(train_X)}')
+            print()
          
         if (t==epochs-1) or (t%1==0):
             # get test loss
@@ -242,7 +252,8 @@ def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5
             batch_ids = torch.split(torch.randperm(len(test_X)), m)
             ws = scatter_copies(w, devices)
 
-            print("Testing..")
+            if verbose:
+                print("Testing..")
             tot = 0
             loss = 0
             for b in batch_ids: # batch
@@ -263,11 +274,12 @@ def train(Phi, train_X, train_y, test_X, test_y, s=5120, q=8, epochs=5, reg=5e-5
                 best_acc = test_acc
                 best_loss = test_loss
 
-            print(f'test acc: {test_acc}')
-            print(f'test loss: {test_loss}')
-            print()
+            if verbose:
+                print(f'test acc: {test_acc}')
+                print(f'test loss: {test_loss}')
+                print("best acc:",best_acc.item())
+                print("best loss:",best_loss.item())
+                print()
     
-    print("best acc",best_acc.item())
-    print("best loss",best_loss.item())
     return best_w
 
